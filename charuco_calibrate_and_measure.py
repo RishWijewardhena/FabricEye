@@ -35,7 +35,7 @@ import os
 # ---------- CONFIG ----------
 CALIB_FILE = "camera_calibration.json"    # saved intrinsics
 EXTRINSICS_FILE = "camera_extrinsics.json" # saved extrinsics (rvec,tvec) for the board pose in scene
-CAMERA_INDEX = 2  # change if needed (0,1,2...)
+CAMERA_INDEX = 1  # change if needed (0,1,2...)
 
 # ChArUco board parameters (must match the physical board you use)
 DICT_TYPE = cv2.aruco.DICT_5X5_50
@@ -43,7 +43,7 @@ SQUARES_X = 5
 SQUARES_Y = 7
 SQUARE_LENGTH = 0.012
 MARKER_LENGTH = 0.009
-MIN_CHARUCO_CORNERS = 4
+MIN_CHARUCO_CORNERS = 4 
 
 # ----------------------------
 
@@ -58,11 +58,22 @@ def load_json(path):
 
 
 # Build detectors and board
+# ArUco dictionary describing marker bit patterns/ids (e.g. DICT_5X5_50)
 aruco_dict = cv2.aruco.getPredefinedDictionary(DICT_TYPE)
+
+# Create a ChArUco board object: (cols, rows), square side, marker side, and the ArUco dictionary
 board = cv2.aruco.CharucoBoard((SQUARES_X, SQUARES_Y), SQUARE_LENGTH, MARKER_LENGTH, aruco_dict)
+
+# Generic ArUco detector tuning parameters (adjust fields to tweak detection behavior)
 params = cv2.aruco.DetectorParameters()
+
+# ChArUco-specific detection/refinement parameters (separate in newer OpenCV versions)
 charuco_params = cv2.aruco.CharucoParameters()
+
+# Detector that handles ChArUco board detection using the board spec and params
 charuco_detector = cv2.aruco.CharucoDetector(board, charuco_params, params)
+
+# Detector for plain ArUco marker detection (used to find markers before ChArUco corner refinement)
 aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, params)
 
 
@@ -88,9 +99,23 @@ def calibrate_camera_live():
     print("\n=== Live ChArUco calibration ===")
     print("Instructions:")
     print(" - Show the board to the camera and move/rotate the board (camera fixed).")
-    print(" - Press SPACE to capture a frame when the board is well-detected.")
+    print(" - Press SPACE or left-click to capture a frame when the board is well-detected.")
     print(" - Collect 15-30 varied frames. Press 'c' to run calibration when ready.")
     print(" - Press 'q' to cancel.")
+
+    #create a window for the mouse callback
+    captured_click=False
+    calibrate_click=False
+    def _on_click(event, x, y, flags, param):
+        nonlocal captured_click, calibrate_click #nonlocal to modify outer variable
+        if event == cv2.EVENT_LBUTTONDOWN:
+            captured_click = True
+
+        if event==cv2.EVENT_RBUTTONDOWN:
+            calibrate_click = True
+
+    cv2.namedWindow('Calibration -Live')
+    cv2.setMouseCallback('Calibration -Live', _on_click)
 
     while True:
         ret, frame = cap.read()
@@ -99,7 +124,7 @@ def calibrate_camera_live():
         if image_size is None:
             image_size = (frame.shape[1], frame.shape[0])
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # convert to grayscale
         marker_corners, marker_ids, _ = aruco_detector.detectMarkers(gray)
         charuco_corners, charuco_ids, _, _ = charuco_detector.detectBoard(gray)
 
@@ -111,10 +136,11 @@ def calibrate_camera_live():
             cv2.putText(disp, f"Charuco corners: {len(charuco_corners)}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
         cv2.putText(disp, f"Captured frames: {frame_count}", (10, disp.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
-        cv2.imshow('Calibration - live', disp)
+        cv2.imshow('Calibration -Live', disp)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord(' '):
+        if key == ord(' ') or captured_click: #check for space key or mouse click
+            captured_click=False #reset for next click
             if charuco_ids is not None and len(charuco_ids) > MIN_CHARUCO_CORNERS:
                 all_charuco_corners.append(charuco_corners)
                 all_charuco_ids.append(charuco_ids)
@@ -123,8 +149,9 @@ def calibrate_camera_live():
             else:
                 print("Not enough Charuco corners detected — move board closer/rotate")
 
-        elif key == ord('c'):
-            if frame_count < 8:
+        elif key == ord('c') or calibrate_click: #check for 'c' key or right mouse click
+            calibrate_click=False #reset for next click
+            if frame_count < 8: #minimum frames to enable the checking
                 print("Collect at least ~8-15 frames for stable intrinsics. Currently:", frame_count)
                 continue
             print("Running calibration...")
@@ -234,174 +261,117 @@ def load_calibration(path):
 def measurement_ui():
     """Interactive measurement using saved intrinsics and extrinsics.
     Controls:
-      - i : load image file (type path in console)
-      - v : use live camera (press SPACE to freeze frame)
-      - click left mouse: choose point(s)
-      - p : compute distance between two clicked points
-      - r : reset clicks
-      - b : (re-)capture extrinsics from live board placement (convenient)
+      - SPACE : freeze a frame
+      - click two points → distance computed automatically
       - q : quit
     """
     if not os.path.exists(CALIB_FILE):
         raise FileNotFoundError("Run calibration first and save intrinsics")
+
     K, dist = load_calibration(CALIB_FILE)
 
-    if not os.path.exists(EXTRINSICS_FILE):
-        print("No extrinsics file found. You can press 'b' inside the UI to capture & save extrinsics using the live camera.")
+    rvec = tvec = R = plane_normal_cam = d = None
 
-    # If extrinsics exist, load them
-    rvec = None
-    tvec = None
     if os.path.exists(EXTRINSICS_FILE):
         e = load_json(EXTRINSICS_FILE)
-        rvec = np.array(e['rvec'], dtype=np.float64).reshape(3,1)
-        tvec = np.array(e['tvec'], dtype=np.float64).reshape(3,1)
-
-    # Precompute board pose stuff if extrinsics loaded
-    if rvec is not None:
+        rvec = np.array(e['rvec'], dtype=np.float64).reshape(3, 1)
+        tvec = np.array(e['tvec'], dtype=np.float64).reshape(3,)
         R, _ = cv2.Rodrigues(rvec)
-        tvec = tvec.reshape(3,)
         plane_normal_cam = R[:, 2]
         d = -plane_normal_cam.dot(tvec)
     else:
-        R = None
-        tvec = None
-        plane_normal_cam = None
-        d = None
+        print("⚠ No extrinsics found — measurement will not work")
 
-    current_img = None
     display = None
     clicks = []
+    measuring = False
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal display, clicks
-        if event == cv2.EVENT_LBUTTONDOWN and display is not None:
+        nonlocal clicks, display
+        if event == cv2.EVENT_LBUTTONDOWN and display is not None and not measuring:
             clicks.append((x, y))
             tmp = display.copy()
             for i, (ux, uy) in enumerate(clicks):
-                cv2.circle(tmp, (ux, uy), 6, (0,0,255), -1)
-                cv2.putText(tmp, f"{i+1}", (ux+6, uy-6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+                cv2.circle(tmp, (ux, uy), 6, (0, 0, 255), -1)
+                cv2.putText(
+                    tmp, f"{i+1}", (ux+6, uy-6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2
+                )
             cv2.imshow('Measure', tmp)
 
     cv2.namedWindow('Measure')
     cv2.setMouseCallback('Measure', on_mouse)
 
     print("\n=== Measurement UI ===")
-    print("| v - live camera (SPACE to freeze)")
-    print("Click two points, press p to compute distance, r to reset, q to quit")
+    print("SPACE: freeze frame")
+    print("Click two points → distance computed automatically")
+    print("q: quit")
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open camera")
+
+    frozen = False
 
     while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        if not frozen:
+            cv2.imshow('Measure', frame)
+
         key = cv2.waitKey(10) & 0xFF
-        # if key == ord('i'):
-        #     path = input("Path to image: ").strip()
-        #     if not os.path.exists(path):
-        #         print("File not found")
-        #         continue
-        #     current_img = cv2.imread(path)
-        #     display = current_img.copy()
-        #     clicks = []
-        #     cv2.imshow('Measure', display)
 
-        # elif key == ord('v'):
-        #     cap = cv2.VideoCapture(CAMERA_INDEX)
-        #     if not cap.isOpened():
-        #         print("Cannot open camera")
-        #         continue
-        #     print("Press SPACE to freeze a frame for measurement")
-        #     while True:
-        #         ret, frame = cap.read()
-        #         if not ret:
-        #             continue
-        #         cv2.imshow('Measure', frame)
-        #         k = cv2.waitKey(1) & 0xFF
-        #         if k == ord(' '):
-        #             current_img = frame.copy()
-        #             display = current_img.copy()
-        #             clicks = []
-        #             cv2.imshow('Measure', display)
-        #             break
-        #         elif k == ord('q'):
-        #             break
-        #     cap.release()
-
-        if key == ord('b'):
-            # capture extrinsics from live board placement (convenient helper)
-            print("Capturing extrinsics (press SPACE to capture board image)")
-            cap = cv2.VideoCapture(CAMERA_INDEX)
-            if not cap.isOpened():
-                print("Cannot open camera")
-                continue
-            captured = None
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-                cv2.imshow('Measure', frame)
-                k = cv2.waitKey(1) & 0xFF
-                if k == ord(' '):
-                    captured = frame.copy()
-                    break
-                elif k == ord('q'):
-                    break
-            cap.release()
-            if captured is None:
-                print("No capture — abort")
-                continue
-            gray = cv2.cvtColor(captured, cv2.COLOR_BGR2GRAY)
-            marker_corners, marker_ids, _ = aruco_detector.detectMarkers(gray)
-            charuco_corners, charuco_ids, _, _ = charuco_detector.detectBoard(gray)
-            if charuco_ids is None or len(charuco_ids) < MIN_CHARUCO_CORNERS:
-                print("Not enough Charuco corners detected. Re-try placing the board and capture again.")
-                continue
-            # obj_pts = board.chessboardCorners[charuco_ids.flatten()] #old
-            obj_pts = board.getChessboardCorners()[charuco_ids.flatten()]
-            img_pts = charuco_corners.reshape(-1,2)
-            K, dist = load_calibration(CALIB_FILE)
-            ok, rvec_new, tvec_new = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
-            if not ok:
-                print("solvePnP failed")
-                continue
-            save_json(EXTRINSICS_FILE, {'rvec': rvec_new.reshape(-1).tolist(), 'tvec': tvec_new.reshape(-1).tolist()})
-            print(f"Saved extrinsics to {EXTRINSICS_FILE}")
-            # update in-memory pose
-            rvec = rvec_new
-            tvec = tvec_new.reshape(3,)
-            R, _ = cv2.Rodrigues(rvec)
-            plane_normal_cam = R[:,2]
-            d = -plane_normal_cam.dot(tvec)
-
-        elif key == ord('r'):
+        # -------- Freeze frame --------
+        if key == ord(' '):
+            display = frame.copy()
             clicks = []
-            if display is not None:
-                cv2.imshow('Measure', display)
+            frozen = True
+            cv2.imshow('Measure', display)
+            print("Frame frozen. Click two points.")
 
-        elif key == ord('p'):
-            if display is None:
-                print("Load or capture an image first (i or v)")
+        # -------- Compute distance automatically --------
+        if len(clicks) == 2 and frozen:
+            if R is None:
+                print("❌ No extrinsics available")
+                clicks = []
                 continue
-            if len(clicks) < 2:
-                print("Click two points first")
-                continue
-            if rvec is None:
-                print("No extrinsics available. Press 'b' to capture extrinsics, or provide camera_extrinsics.json first.")
-                continue
+
+            measuring = True
             try:
                 p1 = image_to_plane(clicks[0], K, dist, R, tvec, plane_normal_cam, d)
                 p2 = image_to_plane(clicks[1], K, dist, R, tvec, plane_normal_cam, d)
+                dist_m = np.linalg.norm(p1 - p2)
             except Exception as e:
                 print("Projection error:", e)
+                clicks = []
+                measuring = False
                 continue
-            dist_m = np.linalg.norm(p1 - p2)
+
             print(f"Distance = {dist_m:.6f} m  ({dist_m*100:.2f} cm)")
+
             out = display.copy()
-            cv2.line(out, tuple(map(int, clicks[0])), tuple(map(int, clicks[1])), (255,0,0), 2)
-            mid = ((clicks[0][0]+clicks[1][0])//2, (clicks[0][1]+clicks[1][1])//2)
-            cv2.putText(out, f"{dist_m*100:.2f} cm", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
+            cv2.line(out, clicks[0], clicks[1], (255, 0, 0), 2)
+            mid = (
+                (clicks[0][0] + clicks[1][0]) // 2,
+                (clicks[0][1] + clicks[1][1]) // 2
+            )
+            cv2.putText(
+                out, f"{dist_m*100:.2f} cm", mid,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2
+            )
+
             cv2.imshow('Measure', out)
 
+            clicks = []          # reset for next measurement
+            measuring = False
+
+        # -------- Quit --------
         elif key == ord('q'):
             break
 
+    cap.release()
     cv2.destroyAllWindows()
 
 
